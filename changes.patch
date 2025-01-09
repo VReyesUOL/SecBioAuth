@@ -1,0 +1,161 @@
+Subject: [PATCH] Provide GPU multi_bit_sum and multi_bit_scalar_comparison calls
+---
+Index: projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_scalar_comparison.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_scalar_comparison.rs b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_scalar_comparison.rs
+new file mode 100644
+--- /dev/null	(revision 3b149e7e8f9bda9571c5f5ff5ca3f87cd35de75b)
++++ b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_scalar_comparison.rs	(revision 3b149e7e8f9bda9571c5f5ff5ca3f87cd35de75b)
+@@ -0,0 +1,71 @@
++use crate::core_crypto::gpu::CudaStreams;
++use crate::core_crypto::gpu::lwe_ciphertext_list::CudaLweCiphertextList;
++use crate::core_crypto::gpu::lwe_keyswitch_key::CudaLweKeyswitchKey;
++use crate::core_crypto::gpu::lwe_multi_bit_bootstrap_key::CudaLweMultiBitBootstrapKey;
++use crate::core_crypto::gpu::vec::CudaVec;
++use crate::core_crypto::prelude::{CiphertextModulus, LweCiphertextCount, UnsignedTorus};
++use crate::integer::block_decomposition::{BlockDecomposer, DecomposableInto};
++use crate::integer::gpu::{unchecked_scalar_comparison_integer_radix_kb_async, ComparisonType, PBSType};
++use crate::prelude::CastInto;
++use crate::shortint::MultiBitPBSParameters;
++
++pub fn cuda_lwe_multi_bit_unsigned_scalar_comparison<Scalar, CompScalar>(
++    input: &CudaLweCiphertextList<Scalar>,
++    d_multibit_bsk: &CudaLweMultiBitBootstrapKey,
++    scalar: CompScalar,
++    key_switching_key: &CudaLweKeyswitchKey<Scalar>,
++    op: ComparisonType,
++    params: MultiBitPBSParameters, stream: &CudaStreams
++) -> CudaLweCiphertextList<Scalar> where
++// CastInto required for PBS modulus switch which returns a usize
++    Scalar: UnsignedTorus + CastInto<usize>,
++    CompScalar: DecomposableInto<Scalar>,
++{
++    let mut result = CudaLweCiphertextList::new(
++        input.lwe_dimension(),
++        LweCiphertextCount(1),
++        CiphertextModulus::new_native(),
++        stream,
++    );
++
++    let mut scalar_blocks =
++        BlockDecomposer::with_early_stop_at_zero(scalar, params.message_modulus.0.ilog2())
++            .iter_as::<Scalar>()
++            .collect::<Vec<_>>();
++    scalar_blocks.truncate(input.lwe_ciphertext_count().0);
++
++    unsafe {
++        let d_scalar_blocks: CudaVec<Scalar> = CudaVec::from_cpu_async(&scalar_blocks, stream, 0);
++
++        unchecked_scalar_comparison_integer_radix_kb_async(
++            stream,
++            &mut result.0.d_vec,
++            &input.0.d_vec,
++            &d_scalar_blocks,
++            &d_multibit_bsk.d_vec,
++            &key_switching_key.d_vec,
++            params.message_modulus,
++            params.carry_modulus,
++            d_multibit_bsk.glwe_dimension,
++            d_multibit_bsk.polynomial_size,
++            key_switching_key
++                .input_key_lwe_size()
++                .to_lwe_dimension(),
++            key_switching_key
++                .output_key_lwe_size()
++                .to_lwe_dimension(),
++            key_switching_key.decomposition_level_count(),
++            key_switching_key.decomposition_base_log(),
++            d_multibit_bsk.decomp_level_count,
++            d_multibit_bsk.decomp_base_log,
++            input.lwe_ciphertext_count().0 as u32,
++            scalar_blocks.len() as u32,
++            op,
++            false,
++            PBSType::MultiBit,
++            d_multibit_bsk.grouping_factor,
++        );
++    }
++    stream.synchronize();
++    result
++}
+Index: projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_sum.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_sum.rs b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_sum.rs
+new file mode 100644
+--- /dev/null	(revision 3b149e7e8f9bda9571c5f5ff5ca3f87cd35de75b)
++++ b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/lwe_multi_bit_sum.rs	(revision 3b149e7e8f9bda9571c5f5ff5ca3f87cd35de75b)
+@@ -0,0 +1,45 @@
++use crate::core_crypto::gpu::CudaStreams;
++use crate::core_crypto::gpu::lwe_ciphertext_list::CudaLweCiphertextList;
++use crate::core_crypto::gpu::lwe_keyswitch_key::CudaLweKeyswitchKey;
++use crate::core_crypto::gpu::lwe_multi_bit_bootstrap_key::CudaLweMultiBitBootstrapKey;
++use crate::core_crypto::prelude::UnsignedTorus;
++use crate::integer::gpu::{unchecked_partial_sum_ciphertexts_integer_radix_kb_assign_async, PBSType};
++use crate::prelude::CastInto;
++use crate::shortint::MultiBitPBSParameters;
++
++pub fn cuda_lwe_multi_bit_sum<Scalar>(
++    input: &mut CudaLweCiphertextList<Scalar>,
++    result: &mut CudaLweCiphertextList<Scalar>,
++    d_multibit_bsk: &CudaLweMultiBitBootstrapKey,
++    key_switching_key: &CudaLweKeyswitchKey<Scalar>,
++    blocks: usize, num_cts: usize, params: MultiBitPBSParameters, stream: &CudaStreams
++) where
++    // CastInto required for PBS modulus switch which returns a usize
++    Scalar: UnsignedTorus + CastInto<usize>,
++{
++    unsafe {
++        unchecked_partial_sum_ciphertexts_integer_radix_kb_assign_async(
++            &stream,
++            &mut result.0.d_vec,
++            &mut input.0.d_vec,
++            &d_multibit_bsk.d_vec,
++            &key_switching_key.d_vec,
++            params.message_modulus,
++            params.carry_modulus,
++            d_multibit_bsk.glwe_dimension,
++            d_multibit_bsk.polynomial_size,
++            key_switching_key
++                .output_key_lwe_size()
++                .to_lwe_dimension(),
++            key_switching_key.decomposition_level_count(),
++            key_switching_key.decomposition_base_log(),
++            d_multibit_bsk.decomp_level_count,
++            d_multibit_bsk.decomp_base_log,
++            blocks as u32,
++            num_cts as u32,
++            PBSType::MultiBit,
++            d_multibit_bsk.grouping_factor,
++        );
++    }
++    stream.synchronize();
++}
+Index: projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/mod.rs
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/mod.rs b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/mod.rs
+--- a/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/mod.rs	(revision 5e3b793fd7674a5effa4e230c05573449f670505)
++++ b/projects/tfhe-rs/tfhe/src/core_crypto/gpu/algorithms/mod.rs	(revision 3b149e7e8f9bda9571c5f5ff5ca3f87cd35de75b)
+@@ -4,6 +4,8 @@
+ pub mod lwe_multi_bit_programmable_bootstrapping;
+ pub mod lwe_packing_keyswitch;
+ pub mod lwe_programmable_bootstrapping;
++pub mod lwe_multi_bit_sum;
++pub mod lwe_multi_bit_scalar_comparison;
+
+ #[cfg(test)]
+ mod test;
+@@ -13,3 +15,5 @@
+ pub use lwe_multi_bit_programmable_bootstrapping::*;
+ pub use lwe_packing_keyswitch::*;
+ pub use lwe_programmable_bootstrapping::*;
++pub use lwe_multi_bit_sum::*;
++pub use lwe_multi_bit_scalar_comparison::*;

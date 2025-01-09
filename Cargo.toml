@@ -1,0 +1,10 @@
+[package]
+name = "EncryptedBiometrics_8"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tfhe = { version = "0.10.0", features = [ "shortint", "integer", "x86_64-unix", "gpu" ], path = "../tfhe-rs/tfhe" }
+rayon = "1.10.0"
+itertools = "0.13.0"
+rand = "0.9.0-alpha.2"
